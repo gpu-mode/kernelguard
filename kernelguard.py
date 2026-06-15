@@ -494,6 +494,22 @@ def _ast_root_name(expr: ast.AST | None) -> Optional[str]:
     return None
 
 
+def _ast_dotted_name(expr: ast.AST | None) -> Optional[str]:
+    """Return a dotted name such as torch.linalg.householder_product."""
+    parts: list[str] = []
+    cur = expr
+    while cur is not None:
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            return ".".join(reversed(parts))
+        if isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+            continue
+        break
+    return None
+
+
 def _expr_names(expr: ast.AST | None) -> set[str]:
     if expr is None:
         return set()
@@ -502,6 +518,23 @@ def _expr_names(expr: ast.AST | None) -> set[str]:
         for node in ast.walk(expr)
         if isinstance(node, ast.Name)
     }
+
+
+def _target_names(target: ast.AST | None) -> set[str]:
+    """Return all simple names assigned by a target expression."""
+    if target is None:
+        return set()
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for elt in target.elts:
+            names.update(_target_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    root = _ast_root_name(target)
+    return {root} if root else set()
 
 
 def _expr_has_data_ptr(expr: ast.AST | None) -> bool:
@@ -1079,6 +1112,242 @@ def detect_result_caching(code: str | SubmissionFacts) -> list[dict]:
             "evidence": "Runner/plan cache signals: " + ", ".join(runner_plan_signals),
         })
     return matches
+
+
+def detect_value_keyed_output_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Detect cached output replay guarded by full tensor-value equality.
+
+    This catches helper-mediated replay patterns such as:
+    cache[key] = (input.clone(), output.clone())
+    if torch.equal(current_input, cached_input): return cached_output.clone()
+
+    It intentionally requires both a stored input snapshot and an equality-guarded
+    cached-output return so normal workspace, preprocess, and graph caches do not
+    become hard replay findings.
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None or facts.entrypoint_name is None:
+        return []
+
+    function_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    entrypoint = function_defs.get(facts.entrypoint_name)
+    if entrypoint is None:
+        return []
+
+    def _looks_cache_name(name: Optional[str]) -> bool:
+        if not name:
+            return False
+        lowered = name.lower()
+        return any(token in lowered for token in ("cache", "memo"))
+
+    def _reachable_functions() -> set[str]:
+        reachable = {facts.entrypoint_name}
+        pending = [facts.entrypoint_name]
+        while pending:
+            current = pending.pop()
+            fn = function_defs.get(current)
+            if fn is None:
+                continue
+            for call in ast.walk(fn):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+                    continue
+                callee = call.func.id
+                if callee in function_defs and callee not in reachable:
+                    reachable.add(callee)
+                    pending.append(callee)
+        return reachable
+
+    def _assign_parts(stmt: ast.AST) -> tuple[list[ast.AST], ast.AST | None]:
+        if isinstance(stmt, ast.Assign):
+            return list(stmt.targets), stmt.value
+        if isinstance(stmt, ast.AnnAssign):
+            return [stmt.target], stmt.value
+        return [], None
+
+    def _assignment_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
+        return [
+            node
+            for node in ast.walk(fn)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+        ]
+
+    def _is_cache_lookup(value: ast.AST | None) -> bool:
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            return value.func.attr == "get" and _looks_cache_name(_ast_root_name(value.func.value))
+        if isinstance(value, ast.Subscript):
+            return _looks_cache_name(_ast_root_name(value))
+        return False
+
+    def _is_cache_store_target(target: ast.AST | None) -> bool:
+        return isinstance(target, ast.Subscript) and _looks_cache_name(_ast_root_name(target))
+
+    def _clone_roots(expr: ast.AST | None) -> set[str]:
+        roots: set[str] = set()
+        if expr is None:
+            return roots
+        for call in ast.walk(expr):
+            if not isinstance(call, ast.Call):
+                continue
+            if isinstance(call.func, ast.Attribute) and call.func.attr == "clone":
+                root = _ast_root_name(call.func.value)
+                if root:
+                    roots.add(root)
+        return roots
+
+    def _is_tensor_equal_guard(
+        expr: ast.AST | None,
+        input_names: set[str],
+        cached_input_names: set[str],
+    ) -> bool:
+        if expr is None:
+            return False
+        for call in ast.walk(expr):
+            if not isinstance(call, ast.Call):
+                continue
+            args: list[ast.AST] = []
+            dotted = _ast_dotted_name(call.func)
+            if dotted == "torch.equal":
+                args = list(call.args[:2])
+            elif isinstance(call.func, ast.Attribute) and call.func.attr == "equal":
+                args = [call.func.value, *call.args[:1]]
+            if len(args) < 2:
+                continue
+
+            left_names = _expr_names(args[0])
+            right_names = _expr_names(args[1])
+            left_is_input = bool(left_names & input_names)
+            right_is_input = bool(right_names & input_names)
+            left_is_cached = bool(left_names & cached_input_names)
+            right_is_cached = bool(right_names & cached_input_names)
+            if (left_is_input and right_is_cached) or (right_is_input and left_is_cached):
+                return True
+        return False
+
+    def _cache_store_has_input_snapshot_and_output(
+        fn: ast.FunctionDef | ast.AsyncFunctionDef,
+        input_names: set[str],
+    ) -> bool:
+        input_snapshot_vars: set[str] = set()
+        output_snapshot_vars: set[str] = set()
+        computed_output_vars: set[str] = set()
+        assignments = _assignment_nodes(fn)
+
+        for stmt in assignments:
+            targets, value = _assign_parts(stmt)
+            if value is None:
+                continue
+            clone_roots = _clone_roots(value)
+            assigned_names: set[str] = set()
+            for target in targets:
+                assigned_names.update(_target_names(target))
+            if clone_roots & input_names:
+                input_snapshot_vars.update(assigned_names)
+            if any(root not in input_names for root in clone_roots):
+                output_snapshot_vars.update(assigned_names)
+            if isinstance(value, ast.Call) and not _is_cache_lookup(value):
+                for assigned in assigned_names:
+                    lowered = assigned.lower()
+                    if not any(token in lowered for token in ("key", "cache", "cached", "shape")):
+                        computed_output_vars.add(assigned)
+
+        for stmt in assignments:
+            targets, value = _assign_parts(stmt)
+            if value is None or not any(_is_cache_store_target(target) for target in targets):
+                continue
+            value_names = _expr_names(value)
+            clone_roots = _clone_roots(value)
+            has_input_snapshot = bool(
+                (clone_roots & input_names) or (value_names & input_snapshot_vars)
+            )
+            has_output_payload = bool(
+                any(root not in input_names for root in clone_roots)
+                or (value_names & output_snapshot_vars)
+                or (value_names & computed_output_vars)
+            )
+            if has_input_snapshot and has_output_payload:
+                return True
+        return False
+
+    def _cache_symbols(
+        fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[set[str], set[str], set[str]]:
+        cache_hit_names: set[str] = set()
+        cached_input_names: set[str] = set()
+        cached_output_names: set[str] = set()
+
+        for stmt in _assignment_nodes(fn):
+            targets, value = _assign_parts(stmt)
+            if value is None:
+                continue
+            assigned_names: set[str] = set()
+            for target in targets:
+                assigned_names.update(_target_names(target))
+
+            if _is_cache_lookup(value):
+                cache_hit_names.update(assigned_names)
+
+            value_root = _ast_root_name(value)
+            if value_root in cache_hit_names:
+                for target in targets:
+                    if isinstance(target, (ast.Tuple, ast.List)) and target.elts:
+                        cached_input_names.update(_target_names(target.elts[0]))
+                        for elt in target.elts[1:]:
+                            cached_output_names.update(_target_names(elt))
+                    else:
+                        cache_hit_names.update(_target_names(target))
+            elif value_root in cached_output_names:
+                cached_output_names.update(assigned_names)
+
+        return cache_hit_names, cached_input_names, cached_output_names
+
+    def _has_guarded_cached_return(
+        fn: ast.FunctionDef | ast.AsyncFunctionDef,
+        input_names: set[str],
+        cached_input_names: set[str],
+        cached_output_names: set[str],
+    ) -> bool:
+        if not cached_input_names or not cached_output_names:
+            return False
+        for if_node in ast.walk(fn):
+            if not isinstance(if_node, ast.If):
+                continue
+            if not _is_tensor_equal_guard(if_node.test, input_names, cached_input_names):
+                continue
+            for stmt in if_node.body:
+                for nested in ast.walk(stmt):
+                    if not isinstance(nested, ast.Return) or nested.value is None:
+                        continue
+                    if _expr_names(nested.value) & cached_output_names:
+                        return True
+        return False
+
+    for name in sorted(_reachable_functions()):
+        fn = function_defs.get(name)
+        if fn is None:
+            continue
+        input_names = {arg.arg for arg in fn.args.args}
+        if not input_names:
+            continue
+        _, cached_input_names, cached_output_names = _cache_symbols(fn)
+        if not _cache_store_has_input_snapshot_and_output(fn, input_names):
+            continue
+        if _has_guarded_cached_return(fn, input_names, cached_input_names, cached_output_names):
+            return [{
+                "pattern": "OUTPUT_REPLAY_CACHE",
+                "severity": "critical",
+                "evidence": (
+                    "Value-keyed output replay in reachable helper "
+                    f"{name}: stores cloned input/output and returns cached output "
+                    "after torch.equal input check"
+                ),
+            }]
+
+    return []
 
 
 def detect_cuda_graph_replay(code: str | SubmissionFacts) -> list[dict]:
@@ -1879,6 +2148,174 @@ def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
     return []
 
 
+VALIDATION_TORCH_PATCH_TARGETS = frozenset({
+    "torch.triu",
+    "torch.linalg.householder_product",
+})
+
+
+def detect_torch_validation_monkeypatch(code: str | SubmissionFacts) -> list[dict]:
+    """Detect direct monkeypatches of torch functions used by correctness checks."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+
+    hits: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            else:
+                targets = [node.target]
+            for target in targets:
+                dotted = _ast_dotted_name(target)
+                if dotted in VALIDATION_TORCH_PATCH_TARGETS:
+                    hits.append(f"{dotted} = ...")
+
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)):
+            base = _ast_dotted_name(node.args[0])
+            dotted = f"{base}.{node.args[1].value}" if base else None
+            if dotted in VALIDATION_TORCH_PATCH_TARGETS:
+                hits.append(f"setattr({base}, {node.args[1].value!r}, ...)")
+
+    if not hits:
+        return []
+    return [{
+        "pattern": "TORCH_VALIDATION_MONKEYPATCH",
+        "severity": "critical",
+        "evidence": "validation torch function monkeypatch: " + ", ".join(sorted(set(hits))),
+    }]
+
+
+def detect_evaluator_mode_branch(code: str | SubmissionFacts) -> list[dict]:
+    """Detect branching on evaluator CLI mode such as test vs benchmark."""
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None:
+        return []
+
+    mode_literals = {"test", "benchmark", "leaderboard"}
+    saw_argv = False
+    matched_modes: set[str] = set()
+
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "sys"
+                and node.value.attr == "argv"):
+            saw_argv = True
+        elif (isinstance(node, ast.Attribute)
+              and isinstance(node.value, ast.Name)
+              and node.value.id == "sys"
+              and node.attr == "argv"):
+            saw_argv = True
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value in mode_literals:
+                matched_modes.add(node.value)
+
+    if saw_argv and matched_modes:
+        return [{
+            "pattern": "EVALUATOR_MODE_BRANCH",
+            "severity": "critical",
+            "evidence": (
+                "submission branches on sys.argv evaluator mode(s): "
+                + ", ".join(sorted(matched_modes))
+            ),
+        }]
+    return []
+
+
+def detect_benchmark_shape_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Detect public benchmark-shape caches that replay cached factorization outputs."""
+    facts = ensure_submission_facts(code)
+    active = facts.python_active
+
+    signals = []
+    if re.search(r'def\s+_is_benchmark_shape\s*\(', active) or re.search(r'_BENCH(?:MARK)?_SHAPES\b', active):
+        signals.append("explicit benchmark shape gate")
+    if re.search(r'\b_CACHE\s*=\s*\{\}', active) or re.search(r'\b\w*CACHE\w*\s*=\s*\{\}', active):
+        signals.append("module cache dict")
+    if re.search(r'\b_READ_POS\s*=\s*\{\}', active) or re.search(r'%\s*len\s*\(\s*cached\s*\)', active):
+        signals.append("cyclic cached-output cursor")
+    if re.search(r'cached\.append\s*\(\s*(?:result|output|out|entry)\s*\)', active):
+        signals.append("stores computed output in cache")
+    if re.search(r'return\s+_(?:cached|benchmark)\w*\s*\(', active) or re.search(r'return\s+cached\s*\[', active):
+        signals.append("returns cached benchmark output")
+    if re.search(r'\b(?:_content_signature|_tiny_token)\s*\(', active) or re.search(
+        r'\.detach\s*\(\s*\)\s*\.cpu\s*\(\s*\)\s*\.numpy\s*\(\s*\)\s*\.tobytes\s*\(',
+        active,
+    ):
+        signals.append("content/token signature gate")
+    if re.search(
+        r'\b\w*CACHE\w*\s*\[[^\]]+\]\s*=\s*\([\s\S]{0,500}\b[Hh]\b[\s\S]{0,160}\btau\b',
+        active,
+    ) or re.search(
+        r'\b\w*CACHE\w*\s*\[[^\]]+\]\s*=\s*\([\s\S]{0,500}\bout\b',
+        active,
+    ):
+        signals.append("stores factorization output in cache")
+    if re.search(
+        r'def\s+_\w*lookup\s*\([^)]*\):[\s\S]{0,2600}\breturn\s+(?:[Hh]\s*,\s*tau|out|hit)\b',
+        active,
+    ):
+        signals.append("lookup returns cached factorization")
+    if re.search(
+        r'hit\s*=\s*_\w*lookup\s*\(\s*A\b[\s\S]{0,220}?if\s+hit\s+is\s+not\s+None\s*:[\s\S]{0,80}?return\s+hit\b',
+        active,
+    ):
+        signals.append("entrypoint returns lookup hit")
+    if re.search(
+        r'\b[Hh]\s*,\s*tau\s*=\s*_(?:compute|blocked|run)\w*\s*\([^)]*\)[\s\S]{0,260}?_\w*store\s*\(',
+        active,
+    ):
+        signals.append("compute result stored for replay")
+    if re.search(r'\b_(?:BLIND|GUARDED|BENCH)_CACHE\b', active):
+        signals.append("shape-only replay cache")
+
+    required = {
+        "explicit benchmark shape gate",
+        "module cache dict",
+        "stores computed output in cache",
+    }
+    if required.issubset(signals) and (
+        "cyclic cached-output cursor" in signals
+        or "returns cached benchmark output" in signals
+    ):
+        return [{
+            "pattern": "BENCHMARK_SHAPE_REPLAY",
+            "severity": "critical",
+            "evidence": "benchmark-shape output replay signals: " + ", ".join(signals),
+        }]
+    replay_cache_required = {
+        "explicit benchmark shape gate",
+        "module cache dict",
+        "stores factorization output in cache",
+        "lookup returns cached factorization",
+        "entrypoint returns lookup hit",
+    }
+    if replay_cache_required.issubset(signals) and (
+        "content/token signature gate" in signals
+        or "compute result stored for replay" in signals
+        or "shape-only replay cache" in signals
+    ):
+        return [{
+            "pattern": "BENCHMARK_SHAPE_REPLAY",
+            "severity": "critical",
+            "evidence": "benchmark-shape output replay signals: " + ", ".join(signals),
+        }]
+    return []
+
+
 RE_REFERENCE_GENERATE_INPUT = re.compile(r'from\s+reference\s+import\s+generate_input')
 RE_PRECOMPUTE_STATE = re.compile(r'\b(?:_PRECOMPUTE_STATE|_PUBLIC_CASES|_PUBLIC_WARMUP_DUPLICATES)\b')
 RE_PRECOMPUTE_APPEND = re.compile(r'outputs\.append\s*\(\s*_compute_output\s*\(')
@@ -1894,6 +2331,41 @@ def detect_reference_precompute_replay(code: str | SubmissionFacts) -> list[dict
     """
     facts = ensure_submission_facts(code)
     code = facts.python_active
+    public_seed_signals = []
+    if re.search(r'\b_PUBLIC_SPECS\s*=\s*\{', code):
+        public_seed_signals.append("_PUBLIC_SPECS")
+    if re.search(r'\b_PUBLIC_RESULTS\s*=\s*\{', code):
+        public_seed_signals.append("_PUBLIC_RESULTS")
+    if re.search(r'torch\.Generator\s*\(', code) and re.search(r'\.manual_seed\s*\(', code):
+        public_seed_signals.append("manual seeded public input generation")
+    if re.search(r'torch\.randn\s*\(', code):
+        public_seed_signals.append("torch.randn public input synthesis")
+    if re.search(r'["\']output["\']\s*:\s*torch\.geqrf\s*\(', code):
+        public_seed_signals.append("precomputed torch.geqrf output")
+    if re.search(r'\bentry\s*\[\s*["\']fingerprint["\']\s*\]\s*==\s*_fingerprint\s*\(', code):
+        public_seed_signals.append("fingerprint gate")
+    if re.search(r'return\s+\w+\s*\[\s*["\']output["\']\s*\]', code):
+        public_seed_signals.append("returns stored output field")
+
+    public_seed_required = {
+        "_PUBLIC_SPECS",
+        "_PUBLIC_RESULTS",
+        "manual seeded public input generation",
+        "torch.randn public input synthesis",
+        "precomputed torch.geqrf output",
+        "fingerprint gate",
+        "returns stored output field",
+    }
+    if public_seed_required.issubset(public_seed_signals):
+        return [{
+            "pattern": "REFERENCE_PRECOMPUTE_REPLAY",
+            "severity": "critical",
+            "evidence": (
+                "public-seed precompute replay signals: "
+                + ", ".join(public_seed_signals)
+            ),
+        }]
+
     import_hits = []
     imported_functions = set()
     for module_name in sorted(TRUSTED_MODULES):
@@ -2158,6 +2630,226 @@ def detect_pointer_replay(code: str | SubmissionFacts) -> list[dict]:
             }]
 
     return []
+
+
+def detect_object_output_cache_replay(code: str | SubmissionFacts) -> list[dict]:
+    """Detect object/pointer-keyed caches that return stored outputs.
+
+    This covers helper-mediated forms where the replay state is a tuple/dict
+    record rather than a simple ``_last_output`` variable:
+    cached = cache.get(key)
+    cached_id, cached_ref, cached_output = cached
+    if cached_id == id(data) and cached_ref() is data:
+        return cached_output
+    """
+    facts = ensure_submission_facts(code)
+    tree = facts.ast_tree
+    if tree is None or facts.entrypoint_name is None:
+        return []
+
+    function_defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if facts.entrypoint_name not in function_defs:
+        return []
+
+    def _reachable_functions() -> set[str]:
+        reachable = {facts.entrypoint_name}
+        pending = [facts.entrypoint_name]
+        while pending:
+            current = pending.pop()
+            fn = function_defs.get(current)
+            if fn is None:
+                continue
+            for call in ast.walk(fn):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+                    continue
+                callee = call.func.id
+                if callee in function_defs and callee not in reachable:
+                    reachable.add(callee)
+                    pending.append(callee)
+        return reachable
+
+    def _assign_parts(stmt: ast.AST) -> tuple[list[ast.AST], ast.AST | None]:
+        if isinstance(stmt, ast.Assign):
+            return list(stmt.targets), stmt.value
+        if isinstance(stmt, ast.AnnAssign):
+            return [stmt.target], stmt.value
+        return [], None
+
+    def _assignment_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
+        return [
+            node
+            for node in ast.walk(fn)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+        ]
+
+    def _looks_cache_name(name: Optional[str]) -> bool:
+        if not name:
+            return False
+        lowered = name.lower()
+        return any(token in lowered for token in ("cache", "saved", "save"))
+
+    def _is_cache_lookup(value: ast.AST | None) -> bool:
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            return value.func.attr == "get" and _looks_cache_name(_ast_root_name(value.func.value))
+        if isinstance(value, ast.Subscript):
+            return _looks_cache_name(_ast_root_name(value))
+        return False
+
+    def _is_cache_store_target(target: ast.AST | None) -> bool:
+        if isinstance(target, ast.Subscript):
+            return _looks_cache_name(_ast_root_name(target))
+        return any(_looks_cache_name(name) for name in _target_names(target))
+
+    def _is_output_like_name(name: str) -> bool:
+        lowered = name.lower()
+        return (
+            lowered in {"h", "tau", "q", "r"}
+            or any(token in lowered for token in ("output", "result", "out"))
+        )
+
+    def _expr_has_pointer_identity(
+        expr: ast.AST | None,
+        input_names: set[str],
+        pointer_aliases: set[str],
+    ) -> bool:
+        if expr is None:
+            return False
+        if _expr_names(expr) & pointer_aliases:
+            return True
+        for node in ast.walk(expr):
+            if isinstance(node, ast.Call):
+                if (isinstance(node.func, ast.Name)
+                        and node.func.id == "id"
+                        and node.args
+                        and (_expr_names(node.args[0]) & input_names)):
+                    return True
+                if (isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "data_ptr"
+                        and (_expr_names(node.func.value) & input_names)):
+                    return True
+                if (isinstance(node.func, ast.Name)
+                        and any(token in node.func.id.lower() for token in ("storage", "fingerprint", "ver"))
+                        and any(_expr_names(arg) & input_names for arg in node.args)):
+                    return True
+            if isinstance(node, ast.Compare):
+                compare_names = _expr_names(node)
+                has_identity_op = any(isinstance(op, (ast.Is, ast.Eq)) for op in node.ops)
+                has_ref_name = any("ref" in name.lower() for name in compare_names)
+                if has_identity_op and has_ref_name and (compare_names & input_names):
+                    return True
+        return False
+
+    def _pointer_aliases(fn: ast.FunctionDef | ast.AsyncFunctionDef, input_names: set[str]) -> set[str]:
+        aliases: set[str] = set()
+        for stmt in _assignment_nodes(fn):
+            targets, value = _assign_parts(stmt)
+            if _expr_has_pointer_identity(value, input_names, set()):
+                for target in targets:
+                    aliases.update(_target_names(target))
+        return aliases
+
+    def _cached_output_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        cache_hit_names: set[str] = set()
+        cached_output_names: set[str] = set()
+
+        for stmt in _assignment_nodes(fn):
+            targets, value = _assign_parts(stmt)
+            if value is None:
+                continue
+            assigned_names: set[str] = set()
+            for target in targets:
+                assigned_names.update(_target_names(target))
+
+            if _is_cache_lookup(value):
+                cache_hit_names.update(assigned_names)
+
+            value_root = _ast_root_name(value)
+            if value_root in cache_hit_names:
+                for target in targets:
+                    if isinstance(target, (ast.Tuple, ast.List)):
+                        for elt in target.elts:
+                            names = _target_names(elt)
+                            if any(_is_output_like_name(name) for name in names):
+                                cached_output_names.update(names)
+                    else:
+                        cache_hit_names.update(_target_names(target))
+            elif value_root in cached_output_names:
+                cached_output_names.update(assigned_names)
+
+        return cached_output_names
+
+    def _has_pointer_cached_return(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        input_names = {arg.arg for arg in fn.args.args}
+        if not input_names:
+            return False
+        pointer_aliases = _pointer_aliases(fn, input_names)
+        cached_output_names = _cached_output_names(fn)
+
+        for if_node in ast.walk(fn):
+            if not isinstance(if_node, ast.If):
+                continue
+            if not _expr_has_pointer_identity(if_node.test, input_names, pointer_aliases):
+                continue
+            for stmt in if_node.body:
+                for nested in ast.walk(stmt):
+                    if not isinstance(nested, ast.Return) or nested.value is None:
+                        continue
+                    returned_names = _expr_names(nested.value)
+                    if returned_names & cached_output_names:
+                        return True
+                    if any(
+                        _is_output_like_name(name)
+                        and any(token in name.lower() for token in ("cache", "cached", "saved"))
+                        for name in returned_names
+                    ):
+                        return True
+        return False
+
+    def _has_output_store(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        for stmt in _assignment_nodes(fn):
+            targets, value = _assign_parts(stmt)
+            if value is None or not any(_is_cache_store_target(target) for target in targets):
+                continue
+            value_names = _expr_names(value)
+            target_names: set[str] = set()
+            for target in targets:
+                target_names.update(_target_names(target))
+            if any(_is_output_like_name(name) for name in value_names):
+                return True
+            if (any(_is_output_like_name(name) for name in target_names)
+                    and any(_is_output_like_name(name) for name in value_names)):
+                return True
+        return False
+
+    reachable = sorted(_reachable_functions())
+    has_replay_return = any(
+        _has_pointer_cached_return(function_defs[name])
+        for name in reachable
+        if name in function_defs
+    )
+    if not has_replay_return:
+        return []
+
+    has_store = any(
+        _has_output_store(function_defs[name])
+        for name in reachable
+        if name in function_defs
+    )
+    if not has_store:
+        return []
+
+    return [{
+        "pattern": "POINTER_REPLAY",
+        "severity": "critical",
+        "evidence": (
+            "Reachable object/pointer-keyed output cache returns stored outputs "
+            "under id/data_ptr/weakref guard"
+        ),
+    }]
 
 
 def detect_last_call_replay(code: str | SubmissionFacts) -> list[dict]:
@@ -3463,6 +4155,18 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
         "HARNESS_RUNTIME_PATCHING", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
         AMD_MANUAL_HARNESS_FIXTURES, "keep",
     ),
+    "TORCH_VALIDATION_MONKEYPATCH": RulePolicy(
+        "TORCH_VALIDATION_MONKEYPATCH", "evaluator_state_mutation", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "EVALUATOR_MODE_BRANCH": RulePolicy(
+        "EVALUATOR_MODE_BRANCH", "evaluator_mode_branch", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
+    "BENCHMARK_SHAPE_REPLAY": RulePolicy(
+        "BENCHMARK_SHAPE_REPLAY", "result_reuse", "hard", AUTO_FILTER, (),
+        (), "keep",
+    ),
     "SCALED_MM_REF": RulePolicy(
         "SCALED_MM_REF", "reference_path_heuristic", "telemetry", TELEMETRY_ONLY, (),
         (), "split",
@@ -3761,6 +4465,8 @@ CODE_DETECTORS = [
     detect_scaled_mm_ref,
     detect_decode_mm_ref,
     detect_result_caching,
+    detect_value_keyed_output_replay,
+    detect_object_output_cache_replay,
     detect_last_call_replay,
     detect_shape_output_replay,
     detect_timed_input_replay,
@@ -3782,6 +4488,9 @@ CODE_DETECTORS = [
     detect_introspection_exploit,
     detect_code_replacement,
     detect_harness_runtime_patching,
+    detect_torch_validation_monkeypatch,
+    detect_evaluator_mode_branch,
+    detect_benchmark_shape_replay,
     detect_config_cache_exploit,
     detect_reference_precompute_replay,
     detect_pointer_replay,
@@ -3799,6 +4508,8 @@ BASE_DETECTOR_SPECS = [
     ("scaled_mm_ref", detect_scaled_mm_ref),
     ("decode_mm_ref", detect_decode_mm_ref),
     ("result_caching", detect_result_caching),
+    ("value_keyed_output_replay", detect_value_keyed_output_replay),
+    ("object_output_cache_replay", detect_object_output_cache_replay),
     ("last_call_replay", detect_last_call_replay),
     ("shape_output_replay", detect_shape_output_replay),
     ("timed_input_replay", detect_timed_input_replay),
@@ -3819,6 +4530,9 @@ BASE_DETECTOR_SPECS = [
     ("introspection_exploit", detect_introspection_exploit),
     ("code_replacement", detect_code_replacement),
     ("harness_runtime_patching", detect_harness_runtime_patching),
+    ("torch_validation_monkeypatch", detect_torch_validation_monkeypatch),
+    ("evaluator_mode_branch", detect_evaluator_mode_branch),
+    ("benchmark_shape_replay", detect_benchmark_shape_replay),
     ("config_cache_exploit", detect_config_cache_exploit),
     ("reference_precompute_replay", detect_reference_precompute_replay),
     ("pointer_replay", detect_pointer_replay),
@@ -3832,7 +4546,7 @@ BASE_DETECTOR_SPECS = [
 VALID_RULE_OUTCOMES = {AUTO_FILTER, SUSPICIOUS_ONLY, TELEMETRY_ONLY}
 VALID_RULE_TIERS = {"hard", "support", "telemetry"}
 VALID_NONFILTER_CLASSES = {"valid", "low_confidence", "suspicious"}
-BUILTIN_PROFILES = ("default", "strict", "generic")
+BUILTIN_PROFILES = ("default", "strict", "generic", "sol-execbench")
 
 
 # ---------------------------------------------------------------------------
@@ -4019,6 +4733,12 @@ def _builtin_profile_overrides(profile_name: str) -> dict[str, Any]:
                 ],
             },
         }
+    if profile_name == "sol-execbench":
+        return {
+            "entrypoints": {
+                "names": ["custom_kernel", "kernel", "forward", "run"],
+            },
+        }
     raise ValueError(
         f"Unknown profile {profile_name!r}. Available profiles: {', '.join(BUILTIN_PROFILES)}"
     )
@@ -4189,7 +4909,10 @@ def resolve_runtime_config(
         key, value = _parse_override_argument(raw_override)
         _apply_dotted_override(resolved, key, value)
 
-    resolved["profile"] = str(resolved.get("profile") or profile)
+    if profile != DEFAULT_PROFILE_NAME:
+        resolved["profile"] = profile
+    else:
+        resolved["profile"] = str(resolved.get("profile") or profile)
     resolved.setdefault("version", CONFIG_VERSION)
     _validate_runtime_config(resolved)
     return resolved
