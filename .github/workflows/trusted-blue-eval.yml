@@ -12,12 +12,6 @@ on:
         required: false
         default: true
         type: boolean
-  # Auto-fire after blue-pr-sync registers a new patch in the API queue.
-  # The claim step returns HTTP 204 when the queue is empty, so spurious
-  # triggers are no-ops.
-  workflow_run:
-    workflows: ["blue-pr-sync"]
-    types: [completed]
 
 permissions:
   contents: read
@@ -25,22 +19,15 @@ permissions:
 env:
   KERNELGUARD_API_BASE_URL: https://kguard.sinatras.dev
 
-# Per-trigger concurrency group so multiple PRs syncing within seconds of
-# each other do not cancel each other out (GitHub allows only 1 pending +
-# 1 running per group, beyond which new runs auto-cancel). Each
-# blue-pr-sync run carries the candidate head SHA on
-# event.workflow_run.head_sha; manual workflow_dispatch falls back to the
-# unique run id so manual drains never collide with each other either.
+# Manual workflow_dispatch falls back to the unique run id.
 concurrency:
   group: trusted-blue-eval-${{ github.event.workflow_run.head_sha || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   claim:
-    # Skip when triggered by a failed blue-pr-sync (rejected gate, static
-    # security failure, etc.). Manual workflow_dispatch always passes this
-    # check because workflow_run context is empty in that case.
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    # Temporarily disabled while blue submissions are inactive.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: trusted-blue-eval

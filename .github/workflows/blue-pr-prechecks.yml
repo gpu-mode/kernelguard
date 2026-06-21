@@ -1,24 +1,20 @@
 name: blue-pr-prechecks
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
-      - edited
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: blue-pr-prechecks-${{ github.event.pull_request.number }}
+  group: blue-pr-prechecks-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   prechecks:
+    # Temporarily disabled while blue submissions are inactive.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
