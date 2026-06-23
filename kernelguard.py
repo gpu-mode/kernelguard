@@ -139,9 +139,12 @@ RE_CACHE_STORE_OUTPUT = re.compile(
 # `_CACHE[key] = _compile_passthrough(output)`). The method-call form
 # requires the cached value to actually have a `.compile()` attribute,
 # which PyTorch tensors do not.
+# Whitespace tolerance: callers apply this against strip_python_strings_and_comments(...)
+# which emits a space between tokens, so source `_gemm.compile(` becomes
+# `_gemm . compile (`. The `\s*` around the `.` covers both forms.
 RE_CACHE_STORES_COMPILED_CALLABLE = re.compile(
     r'\w*(?:cache|reuse)\w*\s*\[[^\]]+\]\s*=\s*'
-    r'[^=\n]*?\.compile\s*\(',
+    r'[^=\n]*?\s*\.\s*compile\s*\(',
     re.IGNORECASE,
 )
 RE_CPP_CACHE_FAST_RETURN = re.compile(
@@ -243,6 +246,38 @@ def strip_python_comments(code: str) -> str:
     except (tokenize.TokenError, IndentationError, SyntaxError):
         return code
     return tokenize.untokenize(tokens)
+
+
+def strip_python_strings_and_comments(code: str) -> str:
+    """Replace Python COMMENT and STRING tokens with same-length whitespace.
+
+    Used to defeat string-literal / comment decoys: an attacker can plant
+    text matching a legitimate-looking pattern inside a docstring or a
+    `NOTE = "..."` constant to flip a detector signal. Most detectors
+    operate on `python_active` (which strips comments only) — when a
+    detector needs to be robust against in-string decoys, run it against
+    this stripped form instead.
+
+    Preserves line/column offsets so error messages stay roughly intact.
+    Falls back to the original code on tokenize / syntax errors."""
+    try:
+        out = []
+        for tok in tokenize.generate_tokens(io.StringIO(code).readline):
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                out.append(" " * len(tok.string))
+            elif tok.type in (
+                tokenize.NL, tokenize.NEWLINE,
+                tokenize.INDENT, tokenize.DEDENT,
+                tokenize.ENCODING, tokenize.ENDMARKER,
+            ):
+                if tok.type in (tokenize.NL, tokenize.NEWLINE):
+                    out.append("\n")
+            else:
+                out.append(tok.string)
+                out.append(" ")
+        return "".join(out)
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return code
 
 
 def extract_function_block(code: str, func_name: str) -> str:
@@ -1756,7 +1791,16 @@ def detect_result_caching(code: str | SubmissionFacts) -> list[dict]:
         # not a cached result, so it isn't output replay. See
         # RE_CACHE_STORES_COMPILED_CALLABLE for the rationale on why the
         # method-call form is the only one allowlisted (forgery resistance).
-        if not RE_CACHE_STORES_COMPILED_CALLABLE.search(cache_scope):
+        #
+        # Strip strings AND comments from the scope before matching: an
+        # attacker can plant a decoy `_CACHE[key] = foo.compile(...)`
+        # inside a module-level docstring / constant string to enable
+        # suppression while keeping a real output-replay cache in the
+        # active code. cache_scope is already comment-stripped via
+        # strip_python_comments; this adds string-literal stripping.
+        if not RE_CACHE_STORES_COMPILED_CALLABLE.search(
+            strip_python_strings_and_comments(cache_scope)
+        ):
             output_replay_signals.append("direct return from cache[...]")
     if stores_output and output_replay_signals:
         output_replay_signals.append("cache[...] stores output/result tensor")
