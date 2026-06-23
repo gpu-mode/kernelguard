@@ -118,6 +118,32 @@ RE_CACHE_STORE_OUTPUT = re.compile(
     r'\w*(?:cache|reuse)\w*\s*\[[^\]]+\]\s*=\s*(?:result|output|out|c_ref)\b',
     re.IGNORECASE,
 )
+# Cache populated by a `.compile(...)` method call — stores a compiled
+# callable (not an output tensor), so a subsequent `return cache[key]`
+# returns the callable, not a result. Recognizes the standard tile-DSL
+# compile-cache idiom used by TileLang / Triton / CuTeDSL / Pallas:
+#
+#     _KERNEL_CACHE[(M, N, K)] = my_kernel.compile(M=M, N=N, K=K, ...)
+#     _KCACHE[key] = _gemm.compile(...)
+#
+# Variable-name allowlists (e.g. RE_RETURN_CACHE_INDEX's
+# `compiled|kernel|module|func|op` prefix list) miss abbreviated names
+# (e.g. `_KCACHE`, `_CCACHE`, `_TILECACHE`); checking the RHS of the
+# store is more robust because the *value* in the cache is what
+# distinguishes legitimate compile-cache from output replay.
+#
+# Deliberately matches only the `.compile(` method-call form, not a
+# function-call form like `_compile_kernel(out)` — the latter is too
+# easy to forge with an identity passthrough (e.g. attacker defines
+# `_compile_passthrough(x): return x` and writes
+# `_CACHE[key] = _compile_passthrough(output)`). The method-call form
+# requires the cached value to actually have a `.compile()` attribute,
+# which PyTorch tensors do not.
+RE_CACHE_STORES_COMPILED_CALLABLE = re.compile(
+    r'\w*(?:cache|reuse)\w*\s*\[[^\]]+\]\s*=\s*'
+    r'[^=\n]*?\.compile\s*\(',
+    re.IGNORECASE,
+)
 RE_CPP_CACHE_FAST_RETURN = re.compile(
     r'if\s*\([^)]*(?:cache\.last|cache\.prev|lastA|lastB|prevA|prevB)[^)]*\)\s*(?:\{[^{}]{0,200}?\breturn\b|return\b)',
     re.DOTALL,
@@ -1723,7 +1749,15 @@ def detect_result_caching(code: str | SubmissionFacts) -> list[dict]:
     if RE_DATA_PTR_CACHE_KEY.search(cache_scope):
         workspace_signals.append("data_ptr() cache key")
     if RE_RETURN_CACHE_INDEX.search(cache_scope):
-        output_replay_signals.append("direct return from cache[...]")
+        # Suppress when the cache provably stores a compiled callable rather
+        # than an output tensor — `cache[key] = factory.compile(...)` is the
+        # standard tile-DSL compile-cache idiom (TileLang, Triton, CuTeDSL,
+        # Pallas). The subsequent `return cache[key]` returns the callable,
+        # not a cached result, so it isn't output replay. See
+        # RE_CACHE_STORES_COMPILED_CALLABLE for the rationale on why the
+        # method-call form is the only one allowlisted (forgery resistance).
+        if not RE_CACHE_STORES_COMPILED_CALLABLE.search(cache_scope):
+            output_replay_signals.append("direct return from cache[...]")
     if stores_output and output_replay_signals:
         output_replay_signals.append("cache[...] stores output/result tensor")
     elif stores_output:
