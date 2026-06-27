@@ -3444,8 +3444,39 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
     matches = []
     seen_patterns: set[str] = set()
     frame_namespace_aliases: set[str] = set()
+    helper_frame_namespace_params: dict[str, set[int]] = {}
     saw_frame_access = False
     saw_frame_mutation = False
+    function_defs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def expr_has_frame_namespace(expr: ast.AST | None) -> bool:
+        if expr is None:
+            return False
+        if isinstance(expr, ast.Name) and expr.id in frame_namespace_aliases:
+            return True
+        return any(
+            isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
+            for sub in ast.walk(expr)
+        )
+
+    for fn in function_defs:
+        param_positions = {arg.arg: idx for idx, arg in enumerate(fn.args.args)}
+        mutated_params: set[int] = set()
+        for child in ast.walk(fn):
+            if not isinstance(child, ast.Assign):
+                continue
+            for target in child.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in param_positions
+                ):
+                    mutated_params.add(param_positions[target.value.id])
+        if mutated_params:
+            helper_frame_namespace_params[fn.name] = mutated_params
 
     for node in ast.walk(tree):
         # Track aliases of frame globals/locals dicts.
@@ -3473,6 +3504,13 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                     seen_patterns.add(key)
                     saw_frame_access = True
 
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            mutated_positions = helper_frame_namespace_params.get(node.func.id)
+            if mutated_positions:
+                for idx in mutated_positions:
+                    if idx < len(node.args) and expr_has_frame_namespace(node.args[idx]):
+                        saw_frame_mutation = True
+
         # f_back, f_globals, f_locals attribute access
         if isinstance(node, ast.Attribute) and node.attr in ("f_back", "f_globals", "f_locals"):
             key = f".{node.attr}"
@@ -3485,15 +3523,7 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Subscript):
-                    direct_frame_write = any(
-                        isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
-                        for sub in ast.walk(target.value)
-                    )
-                    alias_frame_write = (
-                        isinstance(target.value, ast.Name)
-                        and target.value.id in frame_namespace_aliases
-                    )
-                    if direct_frame_write or alias_frame_write:
+                    if expr_has_frame_namespace(target.value):
                         saw_frame_mutation = True
 
         # sys.modules access
@@ -3600,6 +3630,37 @@ def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
     host_aliases: set[str] = set()
     namespace_aliases: set[str] = set()
     string_aliases: dict[str, str] = {}
+    helper_namespace_patch_params: dict[str, dict[int, set[str]]] = {}
+    function_defs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    for fn in function_defs:
+        param_positions = {arg.arg: idx for idx, arg in enumerate(fn.args.args)}
+        patched_by_position: dict[int, set[str]] = defaultdict(set)
+        local_string_aliases: dict[str, str] = {}
+        for child in ast.walk(fn):
+            if isinstance(child, ast.Assign):
+                static_value = _static_string(child.value)
+                if static_value is not None:
+                    for target in child.targets:
+                        if isinstance(target, ast.Name):
+                            local_string_aliases[target.id] = static_value
+                for target in child.targets:
+                    if not (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in param_positions
+                    ):
+                        continue
+                    key = _static_string(target.slice)
+                    if key is None and isinstance(target.slice, ast.Name):
+                        key = local_string_aliases.get(target.slice.id)
+                    if key in TRUSTED_HARNESS_NAMES:
+                        patched_by_position[param_positions[target.value.id]].add(key)
+        if patched_by_position:
+            helper_namespace_patch_params[fn.name] = patched_by_position
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -3661,6 +3722,8 @@ def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
                 and node.value.id == "sys"
                 and node.attr == "modules"):
             dynamic_discovery.add("sys.modules")
+        elif isinstance(node, ast.Attribute) and node.attr in ("f_globals", "f_locals"):
+            dynamic_discovery.add(f"frame {node.attr}")
         elif (isinstance(node, ast.Call)
               and isinstance(node.func, ast.Attribute)
               and isinstance(node.func.value, ast.Name)
@@ -3695,6 +3758,20 @@ def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
                     setattr_write = True
                 if isinstance(node.args[0], ast.Name) and node.args[0].id in host_aliases:
                     dynamic_discovery.add("main module alias")
+
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            patched_by_position = helper_namespace_patch_params.get(node.func.id)
+            if patched_by_position:
+                for idx, targets in patched_by_position.items():
+                    if idx >= len(node.args):
+                        continue
+                    if any(
+                        isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
+                        for sub in ast.walk(node.args[idx])
+                    ):
+                        globals_write = True
+                        trusted_targets.update(targets)
+                        dynamic_discovery.add("frame globals")
 
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -6787,6 +6864,11 @@ def detect_lazy_tensor(code: str | SubmissionFacts) -> list[dict]:
         return []
 
     matches = []
+    tensor_method_overrides: set[tuple[str, str]] = set()
+    materialization_methods = {
+        "double", "detach", "to", "cpu", "cuda", "float", "half", "bfloat16",
+        "long", "int", "item", "numpy", "clone", "contiguous",
+    }
 
     for node in facts._class_defs:
 
@@ -6833,6 +6915,33 @@ def detect_lazy_tensor(code: str | SubmissionFacts) -> list[dict]:
                 "severity": "high",
                 "evidence": f"torch.Tensor subclass '{node.name}' — may defer computation",
             })
+
+    for node in ast.walk(facts.ast_tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not (
+                isinstance(target, ast.Attribute)
+                and target.attr in materialization_methods
+                and isinstance(target.value, ast.Name)
+            ):
+                continue
+            # Per-instance overrides such as `tensor.double = f` or
+            # `tensor.detach = f` can make check-time materialization execute
+            # work that was skipped inside the timed region. Normal Tensor
+            # subclasses are handled above; this catches the plain-tensor case.
+            if target.attr in {"double", "detach"}:
+                tensor_method_overrides.add((target.value.id, target.attr))
+
+    if tensor_method_overrides:
+        evidence = ", ".join(
+            f"{name}.{method}" for name, method in sorted(tensor_method_overrides)
+        )
+        matches.append({
+            "pattern": "TENSOR_INSTANCE_METHOD_OVERRIDE",
+            "severity": "critical",
+            "evidence": f"plain Tensor instance materialization methods overridden: {evidence}",
+        })
 
     return matches
 
@@ -7521,6 +7630,10 @@ BASE_RULE_REGISTRY: dict[str, RulePolicy] = {
     "LAZY_TENSOR": RulePolicy(
         "LAZY_TENSOR", "timing_manipulation", "telemetry", TELEMETRY_ONLY, (),
         (), "downgrade",
+    ),
+    "TENSOR_INSTANCE_METHOD_OVERRIDE": RulePolicy(
+        "TENSOR_INSTANCE_METHOD_OVERRIDE", "timing_manipulation", "hard", AUTO_FILTER,
+        (), (), "keep",
     ),
     "PRECISION_DOWNGRADE": RulePolicy(
         "PRECISION_DOWNGRADE", "approximation", "telemetry", TELEMETRY_ONLY, (),
@@ -8679,6 +8792,7 @@ AUDIT_RULE_ORDER = [
     "SCALED_MM_REF", "DECODE_MM_REF", "SILENT_FALLBACK", "REFERENCE_PRECOMPUTE_REPLAY", "TORCH_COMPILE_CACHE",
     "HARDCODED_SHAPES", "BENCHMARK_UNSAFE_ALGO_DISPATCH", "INPUT_STRUCTURE_TRUNCATION_DISPATCH", "TRIVIAL_PROBE",
     "OBFUSCATED_EXEC", "DYNAMIC_EXECUTION", "MODULE_RELOAD", "THREAD_INJECTION", "LAZY_TENSOR",
+    "TENSOR_INSTANCE_METHOD_OVERRIDE",
     "TOKEN_PASTE_CUDA_API", "SEQUENCE_BATCH_GRAPH", "PARTIAL_GRAPH_KEY", "RUNTIME_PACKAGE_INSTALL",
     "PRECISION_DOWNGRADE", "SCORE_PHYSICS_FLOOR", "SCORE_IMPOSSIBLE", "SCORE_SUSPECT_FLOOR",
     "SCORE_BROKEN", "SCORE_EXTREME_SPEEDUP", "DUPLICATE_SPAM", "NEAR_CLONE_SPAM",
