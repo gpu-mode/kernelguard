@@ -766,6 +766,32 @@ def _static_string(expr: ast.AST | None) -> Optional[str]:
     return None
 
 
+def _assembled_static_string(expr: ast.AST | None) -> Optional[str]:
+    """Resolve a string only when it is *assembled* from fragments.
+
+    Returns the concatenated value for ``"a" + "b"`` / multi-fragment f-strings /
+    ``"".join([...])``, and ``None`` for a plain string literal.  Assembling an
+    otherwise-static attribute name (e.g. ``'elapsed' + '_time'``) is a deliberate
+    obfuscation signal: legitimate kernels never split a fixed attribute name like
+    that, so it is a high-precision marker for an evasion attempt.
+    """
+    if isinstance(expr, ast.Constant):
+        return None
+    if isinstance(expr, ast.JoinedStr):
+        if sum(1 for value in expr.values if isinstance(value, ast.Constant)) <= 1:
+            return None
+        return _static_string(expr)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        return _static_string(expr)
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "join"
+    ):
+        return _static_string(expr)
+    return None
+
+
 def _expr_has_benchmark_literal(expr: ast.AST | None) -> bool:
     if expr is None:
         return False
@@ -984,8 +1010,17 @@ def detect_timer_monkeypatch(code: str | SubmissionFacts) -> list[dict]:
             "perf_counter", "perf_counter_ns", "monotonic", "monotonic_ns",
             "process_time", "process_time_ns", "time", "time_ns",
         }
+        # Timing/stats attribute names worth obfuscating: a submission that
+        # *assembles* one of these strings to feed setattr is almost certainly
+        # hiding a timer/stat patch (e.g. setattr(getattr(cu,'Event'),
+        # 'elapsed'+'_time', fake)).
+        assembled_timer_attrs = clock_attrs | {
+            "elapsed_time", "synchronize", "Event",
+            "calculate_stats", "Stats",
+        }
         seen_time_patches: set[str] = set()
         seen_cuda_timer_patches: set[str] = set()
+        seen_assembled_timer_patches: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -1013,7 +1048,18 @@ def detect_timer_monkeypatch(code: str | SubmissionFacts) -> list[dict]:
                 attr = _static_string(node.args[1])
                 if attr in clock_attrs:
                     seen_time_patches.add(f"setattr({node.args[0].id}, {attr!r}, ...)")
-            elif isinstance(node, ast.Call):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and len(node.args) >= 2
+            ):
+                assembled_attr = _assembled_static_string(node.args[1])
+                if assembled_attr in assembled_timer_attrs:
+                    seen_assembled_timer_patches.add(
+                        f"setattr(..., {assembled_attr!r} [assembled], ...)"
+                    )
+            if isinstance(node, ast.Call):
                 func_name = _ast_dotted_name(node.func)
                 is_patch_call = (
                     (isinstance(node.func, ast.Name) and node.func.id in patch_aliases)
@@ -3946,6 +3992,142 @@ BASE_TRUSTED_HARNESS_NAMES = frozenset({
 TRUSTED_HARNESS_NAMES = BASE_TRUSTED_HARNESS_NAMES
 
 
+def _subscript_target_is_globals_attr(target: ast.AST) -> bool:
+    """True for a subscript whose object is a literal ``<expr>.__globals__``.
+
+    Matches ``obj.__globals__[key] = value`` and
+    ``getattr(obj, "__globals__")[key] = value`` directly, independent of
+    whether ``key`` is a string literal or an assembled/dynamic expression.
+    """
+    if not isinstance(target, ast.Subscript):
+        return False
+    value = target.value
+    if isinstance(value, ast.Attribute) and value.attr == "__globals__":
+        return True
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "getattr"
+        and len(value.args) >= 2
+        and _static_string(value.args[1]) == "__globals__"
+    )
+
+
+def _expr_is_globals_dict(expr: ast.AST | None, aliases: set[str]) -> bool:
+    if expr is None:
+        return False
+    if isinstance(expr, ast.Name):
+        return expr.id in aliases
+    if isinstance(expr, ast.Attribute) and expr.attr == "__globals__":
+        return True
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "getattr"
+        and len(expr.args) >= 2
+        and _static_string(expr.args[1]) == "__globals__"
+    )
+
+
+def _globals_alias_subscript_write(tree: ast.AST) -> Optional[str]:
+    """Detect a subscript STORE into a function/module ``__globals__`` dict.
+
+    Closes the alias-hop evasion of HARNESS_RUNTIME_PATCHING: the exploit reads
+    ``g = obj.__globals__`` into a local, optionally rebinds it again
+    (``target = g``), then writes the harness reducer back with
+    ``target[key] = fake`` so the store no longer happens syntactically on a
+    ``.__globals__`` attribute.  We track every variable that transitively holds
+    a ``__globals__`` reference through simple ``x = y`` / ``x = expr.__globals__``
+    assignments (to a fixed point, so walk order and alias depth do not matter),
+    then flag any subscript store whose root is such an alias.  Writing into a
+    function's global namespace is the harness-patching primitive itself, so this
+    needs neither a discovery channel nor a trusted-name string literal to be a
+    high-confidence hit.  Reads of ``__globals__`` without a subscript store are
+    deliberately ignored (those stay GLOBALS_ACCESS telemetry).
+
+    Returns a short evidence string when such a write is found, else ``None``.
+    """
+    evidence: Optional[str] = None
+
+    class GlobalsAliasVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.alias_stack: list[set[str]] = [set()]
+
+        @property
+        def aliases(self) -> set[str]:
+            return self.alias_stack[-1]
+
+        def set_evidence(self, value: str) -> None:
+            nonlocal evidence
+            if evidence is None:
+                evidence = value
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_child_scope(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_child_scope(node)
+
+        def _visit_child_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self.alias_stack.append(set(self.aliases))
+            for stmt in node.body:
+                self.visit(stmt)
+                if evidence is not None:
+                    break
+            self.alias_stack.pop()
+
+        def bind_target(self, target: ast.AST, value: ast.AST | None) -> None:
+            if isinstance(target, ast.Name):
+                if _expr_is_globals_dict(value, self.aliases):
+                    self.aliases.add(target.id)
+                else:
+                    self.aliases.discard(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for elt in target.elts:
+                    self.bind_target(elt, None)
+            elif isinstance(target, ast.Starred):
+                self.bind_target(target.value, None)
+
+        def check_target_write(self, target: ast.AST) -> None:
+            if _subscript_target_is_globals_attr(target):
+                self.set_evidence("obj.__globals__[...] = ... (direct global-namespace write)")
+                return
+            if (
+                isinstance(target, ast.Subscript)
+                and _expr_is_globals_dict(target.value, self.aliases)
+            ):
+                self.set_evidence(
+                    "aliased __globals__ dict written via subscript store "
+                    "(harness reducer/global rebind through a local alias)"
+                )
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                self.check_target_write(target)
+            for target in node.targets:
+                self.bind_target(target, node.value)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self.check_target_write(node.target)
+            self.bind_target(node.target, node.value)
+            if node.value is not None:
+                self.visit(node.value)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self.check_target_write(node.target)
+            self.bind_target(node.target, None)
+            self.visit(node.value)
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            for target in node.targets:
+                for name in _target_names(target):
+                    self.aliases.discard(name)
+
+    GlobalsAliasVisitor().visit(tree)
+    return evidence
+
+
 def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern: dynamic runtime patching of trusted evaluator functions.
 
@@ -4149,6 +4331,15 @@ def detect_harness_runtime_patching(code: str | SubmissionFacts) -> list[dict]:
             "pattern": "HARNESS_RUNTIME_PATCHING",
             "severity": "critical",
             "evidence": "builtins namespace mutated at runtime",
+        }]
+    # A subscript store into any function/module __globals__ dict — direct or
+    # reached through an aliased local — is on its own a harness-patching write.
+    globals_alias_evidence = _globals_alias_subscript_write(tree)
+    if globals_alias_evidence is not None:
+        return [{
+            "pattern": "HARNESS_RUNTIME_PATCHING",
+            "severity": "critical",
+            "evidence": globals_alias_evidence,
         }]
     if dynamic_discovery and (globals_write or setattr_write) and len(trusted_targets) >= 1:
         channels = ", ".join(sorted(dynamic_discovery))
