@@ -923,7 +923,11 @@ def _cache_name_allows_output_replay(name: Optional[str]) -> bool:
 def detect_timer_monkeypatch(code: str | SubmissionFacts) -> list[dict]:
     """Pattern 1: torch.cuda.Event replaced with fake class."""
     facts = ensure_submission_facts(code)
-    code = facts.raw_code
+    # Run the textual regexes over comment-stripped source. Comments that merely
+    # *mention* `torch.cuda.Event = ...` (e.g. "we never patch
+    # torch.cuda.synchronize") are a known false-positive source for these
+    # literal-pinned patterns; real assignment syntax survives the strip.
+    code = facts.python_active
     matches = []
     if RE_CUDA_EVENT_ASSIGN.search(code):
         matches.append({
@@ -1036,6 +1040,153 @@ def detect_timer_monkeypatch(code: str | SubmissionFacts) -> list[dict]:
                 "severity": "critical",
                 "evidence": "CUDA timing primitive patched: " + ", ".join(sorted(seen_cuda_timer_patches)),
             })
+        matches.extend(_detect_aliased_cuda_timer_patch(tree))
+    return matches
+
+
+# Timer-attribute writes worth flagging on the torch.cuda module / Event class.
+# Reads or *calls* of these (legitimate timing) are deliberately NOT flagged --
+# only WRITES (setattr / assignment target) are.
+_CUDA_TIMER_WRITE_NAMES = frozenset({"Event", "elapsed_time", "synchronize"})
+
+
+def _detect_aliased_cuda_timer_patch(tree: ast.AST) -> list[dict]:
+    """Flag timer patches that hide behind getattr-aliasing + assembled names.
+
+    The dotted-literal forms (``torch.cuda.Event = ...``,
+    ``torch.cuda.Event.elapsed_time = ...``) are already caught textually, but
+    those regexes leave no token to match once the base is reached through
+    ``getattr`` aliases and the attribute name is built by string concatenation::
+
+        cu = getattr(torch, "cuda")
+        E  = getattr(cu, "Ev" + "ent")
+        m  = "elapsed" + "_time"
+        setattr(E, m, w)              # or:  E.elapsed_time = w
+
+    This builds a conservative 1-hop alias map for ``torch.cuda`` and the
+    ``Event`` class, folds string-concat / bare-string names via
+    ``_static_string``, and flags ``setattr(<base>, <name>, ...)`` plus
+    ``<base>.<attr> = ...`` WRITES whose base resolves to torch.cuda or the Event
+    class and whose name resolves to one of {Event, elapsed_time, synchronize}.
+    """
+    cuda_aliases: set[str] = set()
+    event_aliases: set[str] = set()
+
+    def is_torch_cuda(expr: ast.AST | None) -> bool:
+        # torch.cuda (attribute) or getattr(torch, 'cuda'/'cu'+'da')
+        if _ast_dotted_name(expr) == "torch.cuda":
+            return True
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id == "getattr"
+            and len(expr.args) >= 2
+            and _ast_dotted_name(expr.args[0]) == "torch"
+            and _static_string(expr.args[1]) == "cuda"
+        ):
+            return True
+        return isinstance(expr, ast.Name) and expr.id in cuda_aliases
+
+    def is_event_class(expr: ast.AST | None) -> bool:
+        # torch.cuda.Event, <cuda_alias>.Event, or getattr(<cuda>, 'Event'/'Ev'+'ent')
+        if _ast_dotted_name(expr) == "torch.cuda.Event":
+            return True
+        if (
+            isinstance(expr, ast.Attribute)
+            and expr.attr == "Event"
+            and is_torch_cuda(expr.value)
+        ):
+            return True
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id == "getattr"
+            and len(expr.args) >= 2
+            and is_torch_cuda(expr.args[0])
+            and _static_string(expr.args[1]) == "Event"
+        ):
+            return True
+        return isinstance(expr, ast.Name) and expr.id in event_aliases
+
+    # Variables bound to a foldable string constant, so a name argument such as
+    # ``m = "elapsed" + "_time"; setattr(E, m, w)`` resolves. Conservative: a
+    # name reassigned to anything non-foldable is dropped (value None).
+    str_vars: dict[str, Optional[str]] = {}
+
+    # First pass (source order): record single-hop aliases for torch.cuda and
+    # the Event class so later setattr/assignment writes can resolve their base,
+    # plus the foldable string-variable map.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if is_event_class(node.value):
+                event_aliases.add(target.id)
+            elif is_torch_cuda(node.value):
+                cuda_aliases.add(target.id)
+            else:
+                folded = _static_string(node.value)
+                if folded is not None and target.id not in str_vars:
+                    str_vars[target.id] = folded
+                elif target.id in str_vars and str_vars[target.id] != folded:
+                    str_vars[target.id] = None  # reassigned -> not constant
+
+    def resolve_name(expr: ast.AST | None) -> Optional[str]:
+        """A static string literal/concat, or a foldable string variable."""
+        direct = _static_string(expr)
+        if direct is not None:
+            return direct
+        if isinstance(expr, ast.Name):
+            return str_vars.get(expr.id)
+        return None
+
+    seen: set[str] = set()
+    matches: list[dict] = []
+
+    def flag(base_desc: str, name: str) -> None:
+        key = f"{base_desc}.{name}"
+        if key in seen:
+            return
+        seen.add(key)
+        matches.append({
+            "pattern": "TIMER_MONKEYPATCH",
+            "severity": "critical",
+            "evidence": f"aliased CUDA timer write: {base_desc}.{name} reassigned",
+        })
+
+    for node in ast.walk(tree):
+        # setattr(<base>, <name>, ...) -- name may be a folded string expression.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 3
+        ):
+            name = resolve_name(node.args[1])
+            if name in _CUDA_TIMER_WRITE_NAMES:
+                base = node.args[0]
+                if is_event_class(base):
+                    flag("torch.cuda.Event", name)
+                elif is_torch_cuda(base):
+                    flag("torch.cuda", name)
+            continue
+
+        # <base>.<attr> = ... assignment WRITE (target side only; reads/calls of
+        # elapsed_time are intentionally ignored).
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr in _CUDA_TIMER_WRITE_NAMES
+                ):
+                    if is_event_class(target.value):
+                        flag("torch.cuda.Event", target.attr)
+                    elif is_torch_cuda(target.value):
+                        flag("torch.cuda", target.attr)
+
     return matches
 
 
@@ -3434,6 +3585,82 @@ def detect_globals_mutation(code: str | SubmissionFacts) -> list[dict]:
     return matches
 
 
+def _expr_is_frame_derived(expr: ast.AST | None, frame_aliases: set[str]) -> bool:
+    """True if expr reads from a frame globals/locals dict.
+
+    Either an ``.f_globals``/``.f_locals`` attribute appears anywhere in the
+    expression, or the expression is a bare local already known to alias such a
+    dict. Plain local dicts are NOT frame-derived and never taint.
+    """
+    if expr is None:
+        return False
+    if isinstance(expr, ast.Name):
+        return expr.id in frame_aliases
+    return any(
+        isinstance(sub, ast.Attribute) and sub.attr in ("f_globals", "f_locals")
+        for sub in ast.walk(expr)
+    )
+
+
+def _positional_params(fn: "ast.FunctionDef | ast.AsyncFunctionDef") -> list[str]:
+    """Positional parameter names of a FunctionDef, in call order."""
+    return [arg.arg for arg in (list(fn.args.posonlyargs) + list(fn.args.args))]
+
+
+def _frame_arg_taint_mutation(tree: ast.AST, frame_aliases: set[str]) -> bool:
+    """Flag ``param[...] = ...`` writes through a frame-dict-tainted parameter.
+
+    Resolves callees as module-local FunctionDefs by name, propagates ONE level
+    of argument taint (a frame-derived positional argument taints the matching
+    parameter), and reports whether any tainted parameter is subscript-written
+    inside its function body. This catches the frame-arg indirection::
+
+        def _mutate(ns, name, fn):
+            ns[name] = fn                 # write through a tainted PARAMETER
+        g = sys._getframe(1).f_globals
+        _mutate(g, "calculate_stats", wrapper)   # frame dict passed as ARG
+    """
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if not functions:
+        return False
+
+    # callee name -> set of parameter names bound to a frame-derived argument.
+    tainted_params: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        callee = functions.get(node.func.id)
+        if callee is None:
+            continue
+        params = _positional_params(callee)
+        for idx, arg in enumerate(node.args):
+            if idx >= len(params):
+                break  # *args spillover -- cannot map positionally
+            if _expr_is_frame_derived(arg, frame_aliases):
+                tainted_params.setdefault(callee.name, set()).add(params[idx])
+
+    if not tainted_params:
+        return False
+
+    for name, params in tainted_params.items():
+        fn = functions[name]
+        for sub in ast.walk(fn):
+            if not isinstance(sub, ast.Assign):
+                continue
+            for target in sub.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in params
+                ):
+                    return True
+    return False
+
+
 def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
     """AST pattern 4: split frame-walk access from frame-based mutation."""
     facts = ensure_submission_facts(code)
@@ -3537,6 +3764,15 @@ def detect_introspection_exploit(code: str | SubmissionFacts) -> list[dict]:
                     "severity": "high",
                     "evidence": "sys.modules accessed (potential module namespace manipulation)",
                 })
+
+    # One level of argument taint: a frame-globals/locals dict can be passed to a
+    # module-local helper and mutated through the bound PARAMETER, which the
+    # single-Assign alias tracking above never sees. For each call to a
+    # module-local FunctionDef, if a positional argument is frame-dict-derived
+    # (an .f_globals/.f_locals attribute, or a local already in the alias set),
+    # taint the matching parameter and flag subscript-writes through it.
+    if not saw_frame_mutation and _frame_arg_taint_mutation(tree, frame_namespace_aliases):
+        saw_frame_mutation = True
 
     if saw_frame_mutation:
         matches.append({
